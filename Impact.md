@@ -71,68 +71,38 @@ recording saved   → check "ready?"  ─┘
 backup timer ends → report runs anyway (same as today)
 ```
 
-**How "ready?" is checked: today vs. new**
+**Today vs. new**
 | | Today | New |
 |---|---|---|
-| When we check | Once, **6 minutes** after `callEnd` (a fixed timer) | Right after something finishes: `callEnd`, an answer scored, a recording saved |
-| What we check | Only "are answers still being scored?" (pending counter) | All 4 conditions above |
-| If not ready | Wait 30 s and check again, up to 3.5 min: **a polling loop** | Do nothing; the next event checks again. **No polling loop** |
-| Number of checks | 1 to 8 checks, all after the 6-minute wait | About 10–20 checks per interview, each a few ms of Redis reads, starting from `callEnd` |
-| If something is missed | Report is built anyway (may miss answers) | Backup timer still builds the report; never slower than today |
+| When we check | 6 min after `callEnd`, then every 30 s (polling) | Each time something finishes |
+| What we check | Pending counter only | All 4 conditions |
+| Worst case | Report built without late answers | Backup timer fires; never slower than today |
 
-**How the check runs without a loop**
+**How the check runs (no loop):** `triggerReportIfReady()` doesn't run on its own. It's called at the end of code that already runs when work finishes, like a `socket.on` handler that runs once per message. Each call reads Redis, decides "ready or not", and exits.
 
-`triggerReportIfReady()` never runs by itself and has no loop. **Other code calls it** each time something finishes. Each call reads a few Redis values, decides "ready or not", and exits in a few milliseconds.
+Calls are added in 3 places:
+- `callEnd()`: the interview ended.
+- `uncountOnSuccess` in [queueRegistry.ts](incbot-video-system/src/queueRegistry.ts): an answer was scored. This runs once per answer job, after the existing `notePendingDone()`.
+- `saveRecording()`: the recording was saved.
 
-It's like a Socket.IO handler: `socket.on("message", ...)` doesn't poll. It runs once per message. Here, the "messages" are tasks finishing.
+Example (3 answers + recording): checks run at End, after answer 1, after the recording is saved, and after answer 2. Each finds work still pending. The check after answer 3 finds everything done, and the report starts at **10:00:45 instead of 10:06:00**. Whatever finishes last triggers the final check, so nothing needs to poll.
 
-Who calls it: every answer job already goes through this wrapper in [queueRegistry.ts](incbot-video-system/src/queueRegistry.ts). We add one line:
-```js
-const uncountOnSuccess = (kind, idOf, handler) => async (data) => {
-  const result = await handler(data);       // 1. score the answer        (existing)
-  await notePendingDone(kind, idOf(data));  // 2. pending counter - 1     (existing)
-  await triggerReportIfReady(data.roomId);  // 3. NEW: "is the report ready?"
-  return result;
-};
-```
-BullMQ runs this wrapper once per answer job. With 5 answers, the check runs 5 times. **The repetition comes from the jobs, not from a loop.** The same one-line call is added to `callEnd()` and `saveRecording()`.
+**Code changes**
+- **New `src/reportReadiness.ts`:** `triggerReportIfReady(roomId)` runs the 4 checks, then calls `job.promote()` on the waiting report job.
+- **`callEndDelay()`:**
+  - Add a Redis "run once" key (`SET NX`), so the report is never built twice.
+  - Give the 30-second re-queued job a known `jobId`, so it can be promoted.
+- **Gaps to fill:**
+  - Add `roomId` to coding jobs.
+  - If `expectedAnswers` is missing, wait at least 30 s after `callEnd`.
+  - If another service saves the recording URL, it must call us (e.g. `POST /incbot/recordingReady/:roomId`).
+- **Status:** add a `reportStatus` field instead of changing `status`.
 
-Example: 3 answers and a recording.
-| Time | What happened (existing code) | Check finds | Result |
-|---|---|---|---|
-| 10:00:00 | Candidate clicks End → `callEnd()` | answers 1–3 scoring, no recording | do nothing |
-| 10:00:10 | Answer 1 scored → wrapper | answers 2–3 scoring, no recording | do nothing |
-| 10:00:20 | Recording saved → `saveRecording()` | answers 2–3 scoring | do nothing |
-| 10:00:30 | Answer 2 scored → wrapper | answer 3 scoring | do nothing |
-| 10:00:45 | Answer 3 scored → wrapper | **everything done** | **start the report** ✅ |
-
-Today this report would start at 10:06:00.
-
-The function remembers nothing between calls. The progress lives in **Redis** (`report:ended`, the pending counter, `report:received`, the recording URL), and each call just reads it.
-
-**Why polling isn't needed:** whichever task finishes **last** also calls the check, and at that moment everything is done. So there's never a gap where everything is finished but nobody checks. If a call is ever missed (for example, a server crashes mid-job), the 6-minute backup timer still starts the report.
-
-**One exception:** if the recording URL is saved by another service (not `saveRecording()` in this repo), no event fires here. Either that service calls a small endpoint (e.g. `POST /incbot/recordingReady/:roomId`), which is preferred, or we fall back to a light check every 30 s for that one condition until the backup timer.
-
-Main code changes:
-- **New `src/reportReadiness.ts`:** a `triggerReportIfReady(roomId)` function that runs the 4 checks and, if all pass, finds the waiting BullMQ job and calls `job.promote()`.
-- **Where it's called from:**
-  - `callEnd()`, in case everything is already done,
-  - the success wrapper in `queueRegistry.ts` (an answer finished scoring),
-  - `saveRecording()`.
-- **Safety in `callEndDelay()`:**
-  - Add a Redis "run once" key (`SET NX`), so an early start and the backup timer can't both build the report.
-  - Give the "still scoring, wait 30 s" re-queued job a known `jobId`. Today it has none, so it can't be found and promoted.
-- **Small gaps to fill:**
-  - Coding jobs only carry `interviewId`; add `roomId`.
-  - If the frontend doesn't send `expectedAnswers`, wait at least 30 seconds after `callEnd`.
-- **Status:** add a separate `reportStatus: "generating" | "ready"` field instead of changing `status`, because crons and queries filter on `"In Progress"`.
-
-Rollout steps:
-1. Add logs to measure the real wait times.
-2. Make the 6 minutes configurable (`REPORT_START_DELAY_MS`).
-3. Run the new check in "log only" mode (`REPORT_FAST_START=false`).
-4. Turn it on step by step.
+**Rollout:**
+1. Measure the real wait times.
+2. Make the delay configurable (`REPORT_START_DELAY_MS`).
+3. Run the new check in log-only mode.
+4. Enable gradually.
 
 ### Impact
 | | Before | After |
