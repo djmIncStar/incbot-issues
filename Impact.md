@@ -85,7 +85,78 @@ Calls are added in 3 places:
 - `uncountOnSuccess` in [queueRegistry.ts](incbot-video-system/src/queueRegistry.ts): an answer was scored. This runs once per answer job, after the existing `notePendingDone()`.
 - `saveRecording()`: the recording was saved.
 
-Example (3 answers + recording): checks run at End, after answer 1, after the recording is saved, and after answer 2. Each finds work still pending. The check after answer 3 finds everything done, and the report starts at **10:00:45 instead of 10:06:00**. Whatever finishes last triggers the final check, so nothing needs to poll.
+What each call does:
+```
+              triggerReportIfReady()          (new file: reportReadiness.ts)
+                        │
+                        ▼
+         ┌──────────────────────────────┐
+         │ Interview ended?             │
+         │ All answers arrived?         │
+         │ No answers still scoring?    │
+         │ Recording saved?             │
+         └──────────────┬───────────────┘
+                        │
+            ┌───────────┴───────────┐
+            ▼                       ▼
+      any "no" → stop         all "yes" → start report now
+     (a later call will              (job.promote())
+       check again)
+```
+
+Example: 3 answers and a recording.
+```
+┌───────────────────────────────┐
+│ 10:00:00  Candidate clicks End│
+│ callEnd()                     │
+│   → triggerReportIfReady()    │
+└──────────────┬────────────────┘
+               ▼
+        Answers left: 3   Recording: ✗   → NOT READY, stop
+               │
+               ▼
+┌───────────────────────────────┐
+│ 10:00:10  Answer 1 scored     │
+│ uncountOnSuccess()            │
+│   → triggerReportIfReady()    │
+└──────────────┬────────────────┘
+               ▼
+        Answers left: 2   Recording: ✗   → NOT READY, stop
+               │
+               ▼
+┌───────────────────────────────┐
+│ 10:00:20  Recording saved     │
+│ saveRecording()               │
+│   → triggerReportIfReady()    │
+└──────────────┬────────────────┘
+               ▼
+        Answers left: 2   Recording: ✓   → NOT READY, stop
+               │
+               ▼
+┌───────────────────────────────┐
+│ 10:00:30  Answer 2 scored     │
+│ uncountOnSuccess()            │
+│   → triggerReportIfReady()    │
+└──────────────┬────────────────┘
+               ▼
+        Answers left: 1   Recording: ✓   → NOT READY, stop
+               │
+               ▼
+┌───────────────────────────────┐
+│ 10:00:45  Answer 3 scored     │
+│ uncountOnSuccess()            │
+│   → triggerReportIfReady()    │
+└──────────────┬────────────────┘
+               ▼
+        Answers left: 0   Recording: ✓   → READY ✅
+               │
+               ▼
+┌───────────────────────────────┐
+│ 🚀 Report starts now          │
+│    (today: 10:06:00)          │
+└───────────────────────────────┘
+```
+Whatever finishes last triggers the final check, so nothing needs to poll.
 
 **Code changes**
 - **New `src/reportReadiness.ts`:** `triggerReportIfReady(roomId)` runs the 4 checks, then calls `job.promote()` on the waiting report job.
