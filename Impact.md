@@ -80,7 +80,37 @@ backup timer ends → report runs anyway (same as today)
 | Number of checks | 1 to 8 checks, all after the 6-minute wait | About 10–20 checks per interview, each a few ms of Redis reads, starting from `callEnd` |
 | If something is missed | Report is built anyway (may miss answers) | Backup timer still builds the report; never slower than today |
 
-The last task to finish always fires an event, so the check that runs after it sees everything complete. That's why polling isn't needed.
+**How the check runs without a loop**
+
+`triggerReportIfReady()` never runs by itself and has no loop. **Other code calls it** each time something finishes. Each call reads a few Redis values, decides "ready or not", and exits in a few milliseconds.
+
+It's like a Socket.IO handler: `socket.on("message", ...)` doesn't poll. It runs once per message. Here, the "messages" are tasks finishing.
+
+Who calls it: every answer job already goes through this wrapper in [queueRegistry.ts](incbot-video-system/src/queueRegistry.ts). We add one line:
+```js
+const uncountOnSuccess = (kind, idOf, handler) => async (data) => {
+  const result = await handler(data);       // 1. score the answer        (existing)
+  await notePendingDone(kind, idOf(data));  // 2. pending counter - 1     (existing)
+  await triggerReportIfReady(data.roomId);  // 3. NEW: "is the report ready?"
+  return result;
+};
+```
+BullMQ runs this wrapper once per answer job. With 5 answers, the check runs 5 times. **The repetition comes from the jobs, not from a loop.** The same one-line call is added to `callEnd()` and `saveRecording()`.
+
+Example: 3 answers and a recording.
+| Time | What happened (existing code) | Check finds | Result |
+|---|---|---|---|
+| 10:00:00 | Candidate clicks End → `callEnd()` | answers 1–3 scoring, no recording | do nothing |
+| 10:00:10 | Answer 1 scored → wrapper | answers 2–3 scoring, no recording | do nothing |
+| 10:00:20 | Recording saved → `saveRecording()` | answers 2–3 scoring | do nothing |
+| 10:00:30 | Answer 2 scored → wrapper | answer 3 scoring | do nothing |
+| 10:00:45 | Answer 3 scored → wrapper | **everything done** | **start the report** ✅ |
+
+Today this report would start at 10:06:00.
+
+The function remembers nothing between calls. The progress lives in **Redis** (`report:ended`, the pending counter, `report:received`, the recording URL), and each call just reads it.
+
+**Why polling isn't needed:** whichever task finishes **last** also calls the check, and at that moment everything is done. So there's never a gap where everything is finished but nobody checks. If a call is ever missed (for example, a server crashes mid-job), the 6-minute backup timer still starts the report.
 
 **One exception:** if the recording URL is saved by another service (not `saveRecording()` in this repo), no event fires here. Either that service calls a small endpoint (e.g. `POST /incbot/recordingReady/:roomId`), which is preferred, or we fall back to a light check every 30 s for that one condition until the backup timer.
 
