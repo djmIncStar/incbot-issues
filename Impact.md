@@ -71,6 +71,19 @@ recording saved   → check "ready?"  ─┘
 backup timer ends → report runs anyway (same as today)
 ```
 
+**How "ready?" is checked: today vs. new**
+| | Today | New |
+|---|---|---|
+| When we check | Once, **6 minutes** after `callEnd` (a fixed timer) | Right after something finishes: `callEnd`, an answer scored, a recording saved |
+| What we check | Only "are answers still being scored?" (pending counter) | All 4 conditions above |
+| If not ready | Wait 30 s and check again, up to 3.5 min: **a polling loop** | Do nothing; the next event checks again. **No polling loop** |
+| Number of checks | 1 to 8 checks, all after the 6-minute wait | About 10–20 checks per interview, each a few ms of Redis reads, starting from `callEnd` |
+| If something is missed | Report is built anyway (may miss answers) | Backup timer still builds the report; never slower than today |
+
+The last task to finish always fires an event, so the check that runs after it sees everything complete. That's why polling isn't needed.
+
+**One exception:** if the recording URL is saved by another service (not `saveRecording()` in this repo), no event fires here. Either that service calls a small endpoint (e.g. `POST /incbot/recordingReady/:roomId`), which is preferred, or we fall back to a light check every 30 s for that one condition until the backup timer.
+
 Main code changes:
 - **New `src/reportReadiness.ts`:** a `triggerReportIfReady(roomId)` function that runs the 4 checks and, if all pass, finds the waiting BullMQ job and calls `job.promote()`.
 - **Where it's called from:**
