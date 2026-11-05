@@ -1,6 +1,6 @@
 # InCBot Video System: 3 Fixes (Short Version)
 
-Each fix has three parts: **Problem**, **Solution** (files to change, code flow, rollout) and **Impact**.
+Each fix has three parts: **Problem**, **Solution** and **Impact**.
 
 ---
 
@@ -13,93 +13,23 @@ Each fix has three parts: **Problem**, **Solution** (files to change, code flow,
 - **CORS only stops browsers.** A script can call our API directly. Some endpoints and socket events don't check who the caller is. For example, anyone with a `roomId` can call `getTokenBeam` and watch a live interview, or `joinRoom` and read live transcripts.
 
 ### Solution
-
-#### Part A: one clean CORS rule (~1 day)
-
-**Files to change**
-| File | Change |
-|---|---|
-| `node-engine/middlewares/corsMiddleware.ts` | Export one shared allowlist. Return 403 instead of throwing |
-| `src/server.ts` | Remove `cors({ origin: "*" })`. Mount CORS once, before `tenantMiddleware` |
-| `src/websocket.ts` | Use the shared allowlist instead of the local regex |
-
-**Step 1: one allowlist, exported from node-engine** (`corsMiddleware.ts`)
-```ts
-export const ALLOWED_ORIGINS = [
-  /^https:\/\/([a-z0-9-]+\.)*incruiter\.com$/, // https only, anchored at both ends
-  /^http:\/\/localhost:\d+$/,                  // local development
-];
-export const isAllowedOrigin = (origin?: string) =>
-  !!origin && ALLOWED_ORIGINS.some((r) => r.test(origin));
-```
-
-**Step 2: reject with 403, not a thrown error** (inside the same middleware). Today the `origin` callback passes an `Error` to `next()`, and [errorHandler.ts](incbot-video-system/src/common/middleware/errorHandler.ts) turns any error into a 500. Check the origin first instead:
-```ts
-const origin = req.headers.origin;
-if (origin && !isAllowedOrigin(origin)) {
-  logger.warn({ message: "CORS: origin blocked", origin, path: req.path });
-  return res.status(403).json({ message: "Origin not allowed" });
-}
-// origin is either absent (server-to-server, curl) or already validated
-return cors({ origin: true, credentials: true })(req, res, next);
-```
-Leave the existing Host-header check and the Postman key bypass as they are.
-
-**Step 3: mount it once, first** (`server.ts`)
-```ts
-// before                                   // after
-app.use(tenantMiddleware);                  app.use(CORS_PERMISSIONS);   // 1. CORS first
-app.use(cors({ origin: "*" }));             app.use(tenantMiddleware);   // 2. then tenant
-...                                         ...
-app.use("/incbot", CORS_PERMISSIONS, r);    app.use("/incbot", r);       // per-route copy removed
-```
-With CORS first, even a tenant-lookup error goes back with correct CORS headers, so the frontend sees the real error instead of a fake "CORS error".
-
-**Step 4: sockets use the same list** (`websocket.ts`). Use Socket.IO's `allowRequest` hook. It runs for every new connection, including direct WebSocket upgrades:
-```ts
-import { isAllowedOrigin } from "@/node-engine/middlewares/corsMiddleware";
-
-const ENFORCE = process.env.SOCKET_ORIGIN_ENFORCE === "true";
-
-const io = new SocketIOServer(server, {
-  transports: ["websocket"],
-  allowRequest: (req, cb) => {
-    const ok = isAllowedOrigin(req.headers.origin);
-    if (!ok) console.warn(`[socket] origin not allowed: ${req.headers.origin}`);
-    cb(null, ok || !ENFORCE); // log-only until ENFORCE=true
-  },
-});
-```
-Delete the old `allowedDomains` array and the `cors.origin` callback.
-
-**Rollout**
-- **HTTP change:** low risk. Bad origins are *already* blocked on `/incbot` today; only the status code changes, from 500 to 403. Ship it directly.
-- **Socket change:** this *tightens* the rule (no more `http://`, no look-alike domains), so first deploy with `SOCKET_ORIGIN_ENFORCE=false` for 1 week. Check the logs for blocked origins. If they're all junk, set it to `true`.
-
-#### Part B: real identity checks (follow-up tickets)
-
-CORS can't stop scripts, so the server must check **who** is calling.
-
-| Where | Change |
-|---|---|
-| **Socket connect** (`websocket.ts`) | Add `io.use()` auth middleware. The client sends its token in `io(url, { auth: { token } })`. The server looks it up the same way `USER_PERMISSIONS` does (`EncryptedToken` → JWT → `interviewId`, `tenantId`). Save the result on `socket.data.auth` |
-| **`joinRoom`** | Allow only if `roomId` belongs to `socket.data.auth.interviewId`. Remove the "no roomId → generate a new room" branch |
-| **`interview-active`, `stt:*`, `tts:*`** | Use `tenantId` from `socket.data.auth`, never from the event payload. Reject if not authenticated |
-| **`GET /getTokenBeam`** | Add a `BEAM_PERMISSION` middleware: the recorder sends a secret header (stored in Key Vault), compared with `crypto.timingSafeEqual` |
-| **`/test-merge-recording`** | Delete the route |
-| **`getInterviewInfo`, `getInterviewToken`** | Check what the pre-join page sends. If the candidate has no token yet, strip sensitive fields from the response |
-
-Code flow for socket auth:
-```
-client: io(url, { auth: { token } })
-   → io.use(): EncryptedToken.findOne({ encryptedAccessToken: token, status: "active" })
-             → jwt.verify(accessToken) → { interviewId, tenantId }
-             → socket.data.auth = { interviewId, tenantId, role }
-   → joinRoom(roomId): InCBotInterview.findOne({ _id: interviewId, roomId }) ? join : reject
-```
-Rollout: (1) the frontend starts sending the token, while the server ignores it. (2) The server checks it but only logs failures. (3) Enforce with `SOCKET_AUTH_ENFORCE=true`.
-
-Note: the candidate token is created in `callStart` ([transcribeService.ts:600-633](incbot-video-system/src/api/incbot/services/transcribeService.ts#L600-L633)). Confirm the frontend joins the socket room only after `callStart`, or issue the token earlier.
+1. **One allowlist.** In `node-engine/middlewares/corsMiddleware.ts`, export a single `isAllowedOrigin()` helper that Express and Socket.IO both use:
+   ```ts
+   /^https:\/\/([a-z0-9-]+\.)*incruiter\.com$/   // https only, anchored at both ends
+   ```
+2. **One CORS layer** (`server.ts`):
+   - Delete `cors({ origin: "*" })`.
+   - Mount `CORS_PERMISSIONS` once, globally, **before** `tenantMiddleware`, so error responses carry CORS headers too.
+   - Remove the per-route copies.
+3. **403 instead of 500.** Inside `corsMiddleware`, check the origin first and return `403 Origin not allowed`, with the origin logged. Today it passes an error to `next()`, which `errorHandler` turns into a 500.
+4. **Sockets** (`websocket.ts`): replace the local regex with `isAllowedOrigin()`, using Socket.IO's `allowRequest` hook so it also covers direct WebSocket connections.
+5. **Rollout:**
+   - The HTTP change can ship directly. Bad origins are already blocked on `/incbot`; only the status code changes.
+   - The socket rule gets stricter, so run it in **log-only mode for 1 week** (`SOCKET_ORIGIN_ENFORCE=false`), then enforce.
+6. **Follow-up ticket (security):**
+   - **Socket auth:** the client sends its interview token on connect (`auth: { token }`). The server verifies it like `USER_PERMISSIONS` does, then allows `joinRoom` only for that interview's room.
+   - **Beam token:** protect `getTokenBeam` with a secret header (stored in Key Vault).
+   - **Unprotected routes:** delete `/test-merge-recording`, and protect `getInterviewInfo` / `getInterviewToken`.
 
 ### Impact
 | | Before | After |
@@ -108,7 +38,6 @@ Note: the candidate token is created in `callStart` ([transcribeService.ts:600-6
 | Number of CORS rules | 3 | 1 |
 | Blocked request in logs | 500 (looks like a crash) | 403 (clear) |
 | Effect on real users | — | None |
-| Watch a live interview with only a `roomId` (Part B) | Possible | Blocked |
 
 ---
 
@@ -125,122 +54,42 @@ Note: the candidate token is created in `callStart` ([transcribeService.ts:600-6
   So it waits long enough for the worst case.
 
 ### Solution
-Build the report **as soon as it's ready**. Keep the timer only as a backup.
+Build the report **as soon as it's ready**, and keep the timer only as a backup.
 
-**The report is "ready" when all of these are true**
-1. The interview has ended.
-2. All answers have arrived (the frontend tells us how many to expect).
-3. No answers are still being scored (we already have this counter: [pendingEvaluations.ts](incbot-video-system/src/pendingEvaluations.ts)).
-4. The recording URL is saved (AI-conversation interviews only).
+The report is "ready" when:
+1. the interview has ended,
+2. all answers have arrived: the frontend sends `expectedAnswers` with `callEnd`, and the server counts arrivals in Redis (`INCR` in `transcribe()`),
+3. no answers are still being scored (we already have this counter: [pendingEvaluations.ts](incbot-video-system/src/pendingEvaluations.ts)),
+4. the recording URL is saved (AI-conversation interviews only).
 
-**Files to change**
-| File | Change |
-|---|---|
-| `src/reportReadiness.ts` (**new**) | `checkReportReady()` and `triggerReportIfReady()` |
-| `callEndService.ts` → `callEnd()` | Save "ended" + `expectedAnswers` in Redis. Make the delay configurable. Call the trigger |
-| `callEndService.ts` → `callEndDelay()` | Add a "run only once" guard. Give re-queued jobs a findable ID |
-| `transcribeService.ts` → `transcribe()` | Count answers received |
-| `queueRegistry.ts` → `uncountOnSuccess` | Call the trigger after an answer finishes scoring |
-| `codingService.ts` | Add `roomId` to the coding job data (today it only has `interviewId`) |
-| `callEndService.ts` → `saveRecording()` | Call the trigger after the recording is saved |
-| Frontend `callEnd` request | Send `expectedAnswers` = number of `/transcribe` uploads it started |
-
-**Redis keys used** (all expire after 1 day)
+How it works:
 ```
-report:ended:<roomId>      → time callEnd happened
-report:expected:<roomId>   → expectedAnswers sent by the frontend
-report:received:<roomId>   → INCR on every /transcribe that arrives
-report:jobId:<roomId>      → ID of the report job currently waiting
-report:started:<roomId>    → "run once" guard
+callEnd           → schedule the report job with a 10-min backup timer
+answer scored     → check "ready?"  ─┐
+answer uploaded   → check "ready?"   ├─ if ready → job.promote() → report runs now
+recording saved   → check "ready?"  ─┘
+backup timer ends → report runs anyway (same as today)
 ```
 
-**Step 1: new module `src/reportReadiness.ts`**
-```ts
-export async function checkReportReady(roomId: string, interviewId: string) {
-  const missing: string[] = [];
+Main code changes:
+- **New `src/reportReadiness.ts`:** a `triggerReportIfReady(roomId)` function that runs the 4 checks and, if all pass, finds the waiting BullMQ job and calls `job.promote()`.
+- **Where it's called from:**
+  - `callEnd()`, in case everything is already done,
+  - the success wrapper in `queueRegistry.ts` (an answer finished scoring),
+  - `saveRecording()`.
+- **Safety in `callEndDelay()`:**
+  - Add a Redis "run once" key (`SET NX`), so an early start and the backup timer can't both build the report.
+  - Give the "still scoring, wait 30 s" re-queued job a known `jobId`. Today it has none, so it can't be found and promoted.
+- **Small gaps to fill:**
+  - Coding jobs only carry `interviewId`; add `roomId`.
+  - If the frontend doesn't send `expectedAnswers`, wait at least 30 seconds after `callEnd`.
+- **Status:** add a separate `reportStatus: "generating" | "ready"` field instead of changing `status`, because crons and queries filter on `"In Progress"`.
 
-  if (!(await redisClient.exists(`report:ended:${roomId}`))) missing.push("not-ended");
-
-  const expected = Number(await redisClient.get(`report:expected:${roomId}`));
-  const received = Number(await redisClient.get(`report:received:${roomId}`) ?? 0);
-  if (expected && received < expected) missing.push(`answers ${received}/${expected}`);
-
-  if ((await pendingCount(roomId, interviewId)) > 0) missing.push("still-scoring");
-
-  if (await needsRecording(roomId) && !(await hasRecording(roomId))) missing.push("recording");
-
-  return { ready: missing.length === 0, missing };
-}
-
-export async function triggerReportIfReady(roomId: string, interviewId: string) {
-  const { ready, missing } = await checkReportReady(roomId, interviewId);
-  if (!ready) return;
-
-  if (process.env.REPORT_FAST_START !== "true") {          // shadow mode
-    logger.info({ message: "report would start now", roomId, msSinceEnd: /* now - ended */ 0 });
-    return;
-  }
-  const jobId = await redisClient.get(`report:jobId:${roomId}`);
-  const job = jobId ? await queues[getQueueNameFor("callEndDelayNew")]?.getJob(jobId) : null;
-  if (job && (await job.isDelayed())) await job.promote();  // run the waiting job now
-}
-```
-
-**Step 2: `callEnd()` changes**
-```ts
-await redisClient.set(`report:ended:${roomId}`, Date.now(), { EX: 86400 });
-if (input.expectedAnswers) await redisClient.set(`report:expected:${roomId}`, input.expectedAnswers, { EX: 86400 });
-
-const delay = Number(process.env.REPORT_START_DELAY_MS ?? 360000);  // was hard-coded
-await addJob("callEndDelayNew", ..., { delay, jobId: `callEndDelay-${roomId}` });
-await redisClient.set(`report:jobId:${roomId}`, `callEndDelay-${roomId}`, { EX: 86400 });
-
-void triggerReportIfReady(roomId, interviewId);   // everything may already be done
-```
-If the frontend doesn't send `expectedAnswers` (old app version, tab crash), skip check 2. In that case, never promote earlier than **30 seconds** after `callEnd`, to give in-flight uploads time to land.
-
-**Step 3: call the trigger wherever "something finished"**
-```ts
-// transcribeService.transcribe()  – an answer upload arrived
-await redisClient.incr(`report:received:${roomId}`);
-
-// queueRegistry.uncountOnSuccess  – an answer finished scoring
-await notePendingDone(kind, id);
-void triggerReportIfReady(roomId, interviewId);
-
-// callEndService.saveRecording()  – recording URL saved
-void triggerReportIfReady(roomId, interviewId);
-```
-Before `callEnd`, the trigger is a cheap no-op (check 1 fails), so it's safe to call any time.
-
-**Step 4: make `callEndDelay()` safe to call early or twice**
-- **Run once:** right after the "still scoring?" check passes:
-  ```ts
-  const first = await redisClient.set(`report:started:${roomId}`, "1", { NX: true, EX: 86400 });
-  if (first === null) return;   // another run already built this report
-  ```
-  If the report build throws, delete the key so a retry can run. This is the same pattern as the existing mail guard ([callEndService.ts:37-60](incbot-video-system/src/api/incbot/services/callEndService.ts#L37-L60)).
-- **Findable re-queue:** today the "still scoring, wait 30 s" path ([callEndService.ts:568](incbot-video-system/src/api/incbot/services/callEndService.ts#L568)) re-adds the job **without** an ID, so the trigger can't find it. Give it `jobId: callEndDelay-<roomId>-<n>` and store that in `report:jobId:<roomId>`.
-
-**Step 5: dashboard status (needs a PM decision).** Don't change the `status` value: many queries and crons filter on `"In Progress"`. Add a separate field instead, for example `reportStatus: "generating" | "ready"`, which the dashboard shows.
-
-**Code flow, end to end**
-```
-callEnd ──► save ended/expected ──► add job (6-min backup) ──► trigger()
-                                                                  │
-answer uploaded ──► received++                                    │
-answer scored   ──► pending-- ──► trigger() ─┐                    │
-recording saved ──────────────► trigger() ───┼──► checkReportReady()
-                                             │       ├─ not ready → do nothing
-                                             │       └─ ready     → job.promote()
-backup timer ends ──────────────────────────────────► callEndDelay() runs anyway (as today)
-```
-
-**Rollout**
-1. Ship the Redis keys and logs only. Measure the real time from `callEnd` to "everything done".
-2. Turn on `REPORT_START_DELAY_MS`, still at 6 min.
-3. Turn on the trigger in shadow mode (`REPORT_FAST_START=false`): it only logs "would start now".
-4. Set `REPORT_FAST_START=true` for practice interviews, then a few customers, then everyone.
+Rollout steps:
+1. Add logs to measure the real wait times.
+2. Make the 6 minutes configurable (`REPORT_START_DELAY_MS`).
+3. Run the new check in "log only" mode (`REPORT_FAST_START=false`).
+4. Turn it on step by step.
 
 ### Impact
 | | Before | After |
@@ -261,111 +110,41 @@ backup timer ends ────────────────────�
 - So we write very often but read rarely: lots of database cost for little benefit.
 
 ### Solution
-Keep "last seen" in **Redis**. Write to MongoDB only when it matters.
-
-**Files to change**
-| File | Change |
-|---|---|
-| `node-engine/helpers/presence.ts` (**new**) | Shared helper: `markSeen`, `lastSeen`, `forget`. Lives in node-engine because interview-system's cron needs it too |
-| `src/websocket.ts` → `interview-active` | Write to Redis. Write to MongoDB at most once per 5 min |
-| `src/websocket.ts` → `disconnect` | Save the last-seen time to MongoDB when the candidate's socket drops |
-| `callEndService.ts` → `callEndFn()` | Read last-seen from Redis first. Clean up the Redis entry |
-| `node-engine/helpers/CronHelper.ts` → `incbotNetworkIssue()` | Use the newest of Redis and MongoDB. Skip the run if Redis is down |
-
-**Step 1: new helper `node-engine/helpers/presence.ts`**
+Keep "last seen" in **Redis** (fast, in memory). Write to MongoDB only when something important happens.
 ```ts
-const KEY = "incbot:presence";                       // sorted set: member → last-seen time
-const member = (tenantId: string, roomId: string) => `${tenantId}:${roomId}`;
-
-/** Returns false for duplicate beats; persist=true at most once every 5 minutes. */
-export async function markSeen(redis, tenantId: string, roomId: string) {
-  const fresh = await redis.set(`incbot:presence:beat:${roomId}`, "1", { NX: true, EX: 25 });
-  if (fresh === null) return { counted: false, persist: false };   // 4 emitters → 1 write
-
-  await redis.zAdd(KEY, { score: Date.now(), value: member(tenantId, roomId) });
-  const persist = await redis.set(`incbot:presence:db:${roomId}`, "1", { NX: true, EX: 300 });
-  return { counted: true, persist: persist !== null };
-}
-
-export async function lastSeen(redis, tenantId: string, roomId: string): Promise<Date | null> {
-  const score = await redis.zScore(KEY, member(tenantId, roomId));
-  return score ? new Date(score) : null;
-}
-
-export async function forget(redis, tenantId: string, roomId: string) {
-  await redis.zRem(KEY, member(tenantId, roomId));
-}
+// on each heartbeat: fast, no database write
+await redis.zAdd("incbot:presence", { score: Date.now(), value: `${tenantId}:${roomId}` });
 ```
+Main code changes:
+- **New `node-engine/helpers/presence.ts`:** `markSeen()`, `lastSeen()` and `forget()`. It goes in node-engine because the cron in interview-system needs it too.
+- **Heartbeat handler** (`websocket.ts`):
+  - Write to Redis instead of MongoDB.
+  - Ignore repeats from the same room within 25 s (`SET NX EX 25`), which fixes the 4× duplicates.
+  - Write to MongoDB only once every 5 minutes as a backup.
+  - If Redis is down, write to MongoDB as today.
+- **On disconnect** (`websocket.ts`): save the last-seen time to MongoDB when the candidate's socket drops.
+- **On call end** (`callEndFn()`): read last-seen from Redis for the "Interview Ended" row, then remove the room from Redis.
+- **The cron** (`CronHelper.incbotNetworkIssue()`):
+  - Use the **newer** of the Redis and MongoDB times.
+  - **If Redis is down, skip the run**, so we never mark people disconnected because data is missing.
 
-**Step 2: heartbeat handler** (`websocket.ts`, `interview-active`)
-```ts
-// keep the existing guards (roomId present, valid timestamp, interviewEndDate: null)
-let persist = true;                                   // Redis down → old behaviour
-if (redisClient?.isReady) {
-  ({ persist } = await markSeen(redisClient, tenantId, roomId));
-}
-if (persist) {
-  await InCBotInterview.collection.updateOne(        // existing write, now rare
-    { roomId: new mongoose.Types.ObjectId(roomId), interviewEndDate: null },
-    { $set: { interviewActiveTimestamp: new Date() } },
-  );
-}
-```
-If Redis is unavailable, it simply writes to MongoDB as today, so nothing breaks.
-
-**Step 3: on candidate disconnect** (`websocket.ts`, `disconnect`). Copy the Redis last-seen time into MongoDB. MongoDB then holds an exact value right when the candidate drops, which is the moment that matters.
-
-**Step 4: call end** (`callEndService.callEndFn()`, [L400-430](incbot-video-system/src/api/incbot/services/callEndService.ts#L400-L430))
-```ts
-const seen = await lastSeen(redisClient, tenantId, roomId);
-const interviewActiveTimestamp = newest(seen, existing?.interviewActiveTimestamp);
-// pass interviewActiveTimestamp into resolveEndRowTimestamp(...) as today
-await forget(redisClient, tenantId, roomId);
-```
-
-**Step 5: the cron** (`CronHelper.incbotNetworkIssue()`)
-```ts
-if (!redisClient?.isReady) {
-  logger.warn({ message: "presence: Redis down, skipping network-disconnect check this run" });
-  return;  // never flag people because data is missing
-}
-for (const interview of interviews) {
-  const seen = newest(
-    await lastSeen(redisClient, tenantId, String(interview.roomId)),
-    interview.interviewActiveTimestamp,              // MongoDB backup value
-  );
-  // existing rule unchanged, but use `seen` instead of interview.interviewActiveTimestamp
-}
-```
-Using the **newest** of the two values keeps this correct during rollout, while some pods still write only to MongoDB.
-
-**Code flow**
-```
-heartbeat ─► dedupe (25 s) ─► Redis ZADD ─► every 5 min: MongoDB write (backup)
-disconnect ─► MongoDB: last seen
-callEnd ─► read Redis last seen ─► "Interview Ended" row ─► remove from Redis
-cron ─► Redis down? skip : compare newest(Redis, MongoDB) with the existing rule
-```
-
-**Rollout**
-1. Confirm that interview-system uses the **same Redis** as this service. The cron runs there.
-2. Ship `presence.ts` and the cron change (reader) in **both** services first. Nothing writes to Redis yet, so it behaves exactly as today.
-3. Ship the heartbeat change (writer) in incbot-video-system. Watch the MongoDB write rate drop.
-4. Optional, if Product wants: run the cron more often and shorten the 1-hour rule.
+Rollout:
+1. Confirm interview-system uses the same Redis.
+2. Ship the cron change (reader) in both services first.
+3. Ship the heartbeat change (writer).
 
 ### Impact
 | | Before | After |
 |---|---|---|
 | DB writes per interview | ~360 | ~10 (**97% fewer**) |
 | DB writes/sec at 1,000 interviews | ~130 | ~3–4 |
-| Duplicate heartbeats processed | 4× | 1× |
+| Cron work | Loads every live interview | Same query, but reads last-seen from Redis |
 | Detect dropped candidate | ~1 hour | Can be minutes (Product decides) |
-| If Redis goes down | — | Falls back to today's behaviour; no false "disconnected" |
 
 ---
 
 ## Order of work
-1. **CORS Part A:** ~1 day, low risk.
-2. **Report timer:** steps 1–3 (measure, shadow mode), then switch on step by step.
-3. **CORS Part B (socket/beam login checks):** most important for security; needs frontend work.
-4. **Heartbeat in Redis:** ship together with the interview-system team (shared cron).
+1. **CORS fix:** ~1 day, low risk.
+2. **Report timer:** measure first, then switch on step by step.
+3. **Socket/beam login checks:** most important for security.
+4. **Heartbeat in Redis:** plan with the interview-system team.
